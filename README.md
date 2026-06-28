@@ -32,7 +32,7 @@ EduInsight Pro is a 4-module AI-powered education platform addressing these gaps
 ## 🛠️ Tech Stack
 
 - **Frontend:** React (single-file, zero build step)
-- **AI:** Claude Sonnet 4.6 via Anthropic API (learning paths, intervention plans, translations, class insights)
+- **AI:** GROQ API (learning paths, intervention plans, translations, class insights)
 - **Styling:** Pure CSS-in-JS with design tokens
 - **Charts:** Custom SVG (scatter plot, progress bars, risk rings)
 - **Data:** CSV upload support + demo dataset
@@ -45,7 +45,7 @@ EduInsight Pro is a 4-module AI-powered education platform addressing these gaps
 - Enter any topic → AI generates a personalized 6-step learning path with time estimates and free resources
 - Pre-built paths for ML, Data Structures, Python, Web Development
 - 3-topic quiz bank with instant feedback and scoring
-- Live AI tutor chat (powered by Claude) for any question
+- Live AI tutor chat for any question
 
 ### Smart Classroom Analyzer
 - Upload CSV/Excel with student data
@@ -71,13 +71,13 @@ EduInsight Pro is a 4-module AI-powered education platform addressing these gaps
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/eduinsight-pro
+git clone https://github.com/thaariha29/eduinsight-pro
 
 # Install dependencies
 npm install react react-dom
 
 # Add your Anthropic API key to environment
-export ANTHROPIC_API_KEY=your_key_here
+export GROQ_API_KEY=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
 
 # Run
 npm start
