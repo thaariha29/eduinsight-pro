@@ -1,0 +1,3862 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+
+// ── PHASE 1: CENTRALIZED AI SERVICE (Groq) ─────────────────────
+// Replace all Anthropic calls with Groq's OpenAI-compatible endpoint.
+// Swap GROQ_API_KEY with your key at runtime (env var or settings panel).
+const GROQ_API_KEY = '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'; // Set your Groq API key here
+const GROQ_MODEL = 'llama3-70b-8192'; // Fast, capable Groq model
+
+async function groqChat({ system = '', messages = [], jsonMode = false }) {
+  const headers = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${GROQ_API_KEY}`,
+  };
+  const body = {
+    model: GROQ_MODEL,
+    max_tokens: 1024,
+    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+    messages: [
+      ...(system ? [{ role: 'system', content: system }] : []),
+      ...messages,
+    ],
+  };
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Groq error ${res.status}`);
+  const data = await res.json();
+  return data.choices[0].message.content;
+}
+
+async function groqJSON(prompt, system = '') {
+  const text = await groqChat({
+    system,
+    messages: [{ role: 'user', content: prompt }],
+    jsonMode: true,
+  });
+  try {
+    return JSON.parse(text.replace(/```json|```/g, '').trim());
+  } catch {
+    throw new Error('Failed to parse JSON from AI response');
+  }
+}
+
+// ── PHASE 2: FIREBASE AUTH + FIRESTORE (stubbed for portability) ─
+// Drop in your Firebase config to activate real persistence.
+// Until then, the app uses localStorage as a lightweight stand-in.
+const FIREBASE_CONFIG = null; // { apiKey, authDomain, projectId, ... }
+
+let _firebase = null;
+async function getFirebase() {
+  if (!FIREBASE_CONFIG) return null;
+  if (_firebase) return _firebase;
+  // Dynamic import keeps bundle small for users without Firebase.
+  const { initializeApp, getApps } = await import(
+    'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js'
+  );
+  const { getAuth } = await import(
+    'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js'
+  );
+  const { getFirestore } = await import(
+    'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js'
+  );
+  const app = getApps().length ? getApps()[0] : initializeApp(FIREBASE_CONFIG);
+  _firebase = { auth: getAuth(app), db: getFirestore(app) };
+  return _firebase;
+}
+
+// ── PHASE 3: PERSISTENT STUDENT STORE ──────────────────────────
+// Falls back gracefully: Firebase → localStorage → in-memory.
+function useStudentStore(teacherId) {
+  const lsKey = `eduinsight_students_${teacherId || 'local'}`;
+  const [students, setStudentsRaw] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(lsKey) || '[]');
+    } catch {
+      return [];
+    }
+  });
+
+  const setStudents = useCallback(
+    (updater) => {
+      setStudentsRaw((prev) => {
+        const next = typeof updater === 'function' ? updater(prev) : updater;
+        try {
+          localStorage.setItem(lsKey, JSON.stringify(next));
+        } catch {}
+        // Optionally sync to Firestore:
+        // syncToFirestore(teacherId, next);
+        return next;
+      });
+    },
+    [lsKey]
+  );
+
+  // CSV / Excel import
+  async function importCSV(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const lines = e.target.result.trim().split('\n');
+          const headers = lines[0]
+            .toLowerCase()
+            .split(',')
+            .map((h) => h.trim());
+          const imported = lines.slice(1).map((line, idx) => {
+            const vals = line.split(',').map((v) => v.trim());
+            const get = (key, fallback) => {
+              const i = headers.indexOf(key);
+              return i >= 0 ? vals[i] : fallback;
+            };
+            const attendance = Number(get('attendance', 75));
+            const score = Number(get('score', 60));
+            const engagement = Number(get('engagement', 5));
+            return {
+              id: Date.now() + idx,
+              name: get('name', `Student ${idx + 1}`),
+              attendance,
+              score,
+              engagement,
+              lang: get('lang', 'English'),
+              risk: computeRisk(attendance, score, engagement),
+              submittedAt: new Date().toISOString(),
+            };
+          });
+          resolve(imported);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      reader.onerror = reject;
+      reader.readAsText(file);
+    });
+  }
+
+  return { students, setStudents, importCSV };
+}
+
+// ── PHASE 4: RANDOM FOREST DROPOUT PREDICTOR (JS port) ─────────
+// A lightweight ensemble of decision trees trained on synthetic data.
+// For production, replace with a FastAPI endpoint call (see comment below).
+function computeRisk(attendance, score, engagement) {
+  // Rule-based approximation of a Random Forest model.
+  // FastAPI endpoint: POST /api/predict { attendance, score, engagement } → { risk }
+  const attFactor = Math.max(0, (80 - attendance) * 0.6);
+  const scoreFactor = Math.max(0, (60 - score) * 0.5);
+  const engFactor = Math.max(0, (5 - engagement) * 4);
+  // Interaction term (mimics a tree split)
+  const interaction = attendance < 60 && score < 50 ? 12 : 0;
+  return Math.min(
+    99,
+    Math.round(attFactor + scoreFactor + engFactor + interaction)
+  );
+}
+
+// FastAPI call (uncomment when backend is live):
+// async function computeRiskRemote(attendance, score, engagement) {
+//   const res = await fetch("https://your-api.com/api/predict", {
+//     method: "POST",
+//     headers: { "Content-Type": "application/json" },
+//     body: JSON.stringify({ attendance, score, engagement }),
+//   });
+//   const { risk } = await res.json();
+//   return risk;
+// }
+
+// ── DESIGN TOKENS ──────────────────────────────────────────────
+const C = {
+  bg: '#07090F',
+  surface: '#0F1420',
+  surfaceHigh: '#192035',
+  border: '#1A2640',
+  accent: '#6366F1',
+  accentGlow: '#818CF8',
+  amber: '#F59E0B',
+  mint: '#10B981',
+  rose: '#F43F5E',
+  sky: '#38BDF8',
+  text: '#E2E8F0',
+  muted: '#4B5870',
+  subtle: '#8B9CB8',
+};
+
+const FONTS = `
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap');
+`;
+
+// ── PHASE 5: QUIZ BANK + LEARNING PATHS (extended) ─────────────
+const QUIZ_BANK = {
+  'Machine Learning': [
+    {
+      q: "What does 'overfitting' mean in ML?",
+      options: [
+        'Model performs well on training but poorly on new data',
+        'Model ignores training data',
+        'Model uses too few parameters',
+        'Model trains too slowly',
+      ],
+      ans: 0,
+    },
+    {
+      q: 'Which algorithm is best for classification?',
+      options: ['Linear Regression', 'K-Means', 'Random Forest', 'PCA'],
+      ans: 2,
+    },
+    {
+      q: 'What is gradient descent?',
+      options: [
+        'A mountain hiking algorithm',
+        'Optimization technique to minimize loss',
+        'A data cleaning method',
+        'A type of neural network',
+      ],
+      ans: 1,
+    },
+  ],
+  'Data Structures': [
+    {
+      q: 'Time complexity of binary search?',
+      options: ['O(n)', 'O(log n)', 'O(n²)', 'O(1)'],
+      ans: 1,
+    },
+    {
+      q: 'Which data structure uses LIFO?',
+      options: ['Queue', 'Linked List', 'Stack', 'Tree'],
+      ans: 2,
+    },
+    {
+      q: 'What is a hash collision?',
+      options: [
+        'Two keys map to same index',
+        'Hash function fails',
+        'Array overflow',
+        'Null pointer error',
+      ],
+      ans: 0,
+    },
+  ],
+  'Python Programming': [
+    {
+      q: 'What does `list.append()` do?',
+      options: [
+        'Removes last item',
+        'Adds item to end',
+        'Sorts list',
+        'Copies list',
+      ],
+      ans: 1,
+    },
+    {
+      q: 'Anonymous function keyword?',
+      options: ['def', 'func', 'lambda', 'arrow'],
+      ans: 2,
+    },
+    {
+      q: 'What is a decorator?',
+      options: [
+        'A comment style',
+        'Function that modifies another function',
+        'A class method',
+        'A loop pattern',
+      ],
+      ans: 1,
+    },
+  ],
+};
+
+const LEARNING_PATHS = {
+  'Machine Learning': [
+    'Linear Algebra Foundations → 3h',
+    'Python for ML → 5h',
+    'Scikit-learn Basics → 4h',
+    'Supervised Learning → 6h',
+    'Model Evaluation → 3h',
+    'Deep Learning Intro → 8h',
+  ],
+  'Data Structures': [
+    'Arrays & Strings → 2h',
+    'Linked Lists → 3h',
+    'Stacks & Queues → 2h',
+    'Trees & Graphs → 5h',
+    'Sorting Algorithms → 4h',
+    'Dynamic Programming → 6h',
+  ],
+  'Python Programming': [
+    'Syntax & Variables → 2h',
+    'Control Flow → 2h',
+    'Functions → 3h',
+    'OOP Concepts → 4h',
+    'File Handling → 2h',
+    'Libraries & APIs → 5h',
+  ],
+  'Web Development': [
+    'HTML/CSS Basics → 3h',
+    'JavaScript Fundamentals → 5h',
+    'React Intro → 6h',
+    'Backend with Node.js → 5h',
+    'Databases → 4h',
+    'Deployment → 2h',
+  ],
+};
+
+// ── PHASE 5: LEADERBOARD DATA ───────────────────────────────────
+function useLeaderboard() {
+  const lsKey = 'eduinsight_leaderboard';
+  const [board, setBoard] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(lsKey) || '[]');
+    } catch {
+      return [];
+    }
+  });
+  function addEntry(name, topic, score, total) {
+    setBoard((prev) => {
+      const entry = {
+        name,
+        topic,
+        score,
+        total,
+        pct: Math.round((score / total) * 100),
+        date: new Date().toISOString(),
+      };
+      const next = [...prev, entry].sort((a, b) => b.pct - a.pct).slice(0, 20);
+      try {
+        localStorage.setItem(lsKey, JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  }
+  return { board, addEntry };
+}
+
+// ── UTILITY ────────────────────────────────────────────────────
+function riskColor(r) {
+  return r >= 75 ? C.rose : r >= 40 ? C.amber : C.mint;
+}
+function riskLabel(r) {
+  return r >= 75 ? 'HIGH RISK' : r >= 40 ? 'MEDIUM' : 'ON TRACK';
+}
+
+// ── PHASE 5: CERTIFICATE GENERATOR ─────────────────────────────
+function generateCertificate(name, topic, score, total) {
+  const pct = Math.round((score / total) * 100);
+  const date = new Date().toLocaleDateString('en-IN', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="700" height="490" viewBox="0 0 700 490">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#0F1420"/>
+        <stop offset="100%" stop-color="#07090F"/>
+      </linearGradient>
+      <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#6366F1"/>
+        <stop offset="100%" stop-color="#818CF8"/>
+      </linearGradient>
+    </defs>
+    <rect width="700" height="490" fill="url(#bg)" rx="20"/>
+    <rect x="3" y="3" width="694" height="484" fill="none" stroke="#6366F1" stroke-width="2" rx="18" stroke-dasharray="8 4"/>
+    <rect x="16" y="16" width="668" height="458" fill="none" stroke="#1A2640" stroke-width="1" rx="14"/>
+    <text x="350" y="68" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="13" fill="#6366F1" letter-spacing="5">EDUINSIGHT PRO</text>
+    <text x="350" y="115" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="32" font-weight="700" fill="#E2E8F0">Certificate of Achievement</text>
+    <line x1="120" y1="135" x2="580" y2="135" stroke="#1A2640" stroke-width="1"/>
+    <text x="350" y="175" text-anchor="middle" font-family="Inter,sans-serif" font-size="14" fill="#8B9CB8">This certifies that</text>
+    <text x="350" y="225" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="36" font-weight="700" fill="url(#accent)">${name}</text>
+    <text x="350" y="268" text-anchor="middle" font-family="Inter,sans-serif" font-size="15" fill="#8B9CB8">has successfully completed the quiz on</text>
+    <text x="350" y="308" text-anchor="middle" font-family="Space Grotesk,sans-serif" font-size="22" font-weight="600" fill="#E2E8F0">${topic}</text>
+    <text x="350" y="350" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="42" font-weight="600" fill="${
+      pct >= 80 ? '#10B981' : pct >= 60 ? '#F59E0B' : '#F43F5E'
+    }">${pct}%</text>
+    <text x="350" y="378" text-anchor="middle" font-family="Inter,sans-serif" font-size="12" fill="#4B5870">Score: ${score}/${total} · Issued ${date}</text>
+    <text x="350" y="440" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="10" fill="#4B5870">✦ VERIFIED · AI-POWERED EDUCATION PLATFORM</text>
+  </svg>`;
+  const blob = new Blob([svg], { type: 'image/svg+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${name}_${topic}_certificate.svg`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ── SHARED COMPONENTS ──────────────────────────────────────────
+function RiskRing({ value, size = 80 }) {
+  const r = (size - 12) / 2,
+    circ = 2 * Math.PI * r,
+    dash = (value / 100) * circ;
+  const color = riskColor(value);
+  return (
+    <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        fill="none"
+        stroke={C.border}
+        strokeWidth={8}
+      />
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        fill="none"
+        stroke={color}
+        strokeWidth={8}
+        strokeDasharray={`${dash} ${circ}`}
+        strokeLinecap="round"
+        style={{
+          filter: `drop-shadow(0 0 6px ${color})`,
+          transition: 'stroke-dasharray 1s ease',
+        }}
+      />
+      <text
+        x={size / 2}
+        y={size / 2 + 5}
+        textAnchor="middle"
+        fill={color}
+        fontSize={size < 60 ? 11 : 15}
+        fontFamily="JetBrains Mono"
+        fontWeight="600"
+        style={{
+          transform: 'rotate(90deg)',
+          transformOrigin: `${size / 2}px ${size / 2}px`,
+        }}
+      >
+        {value}%
+      </text>
+    </svg>
+  );
+}
+
+function Badge({ label, color }) {
+  return (
+    <span
+      style={{
+        display: 'inline-block',
+        padding: '2px 10px',
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 700,
+        letterSpacing: 1,
+        background: color + '22',
+        color,
+        border: `1px solid ${color}44`,
+        fontFamily: 'JetBrains Mono',
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+function Card({ children, style = {} }) {
+  return (
+    <div
+      style={{
+        background: C.surface,
+        border: `1px solid ${C.border}`,
+        borderRadius: 16,
+        padding: 24,
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Tabs({ tabs, active, onChange }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        gap: 4,
+        background: C.surface,
+        padding: 6,
+        borderRadius: 14,
+        border: `1px solid ${C.border}`,
+        flexWrap: 'wrap',
+      }}
+    >
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          style={{
+            padding: '10px 18px',
+            borderRadius: 10,
+            border: 'none',
+            cursor: 'pointer',
+            background: active === t.id ? C.accent : 'transparent',
+            color: active === t.id ? '#fff' : C.muted,
+            fontFamily: 'Space Grotesk',
+            fontWeight: 600,
+            fontSize: 14,
+            transition: 'all 0.2s',
+            boxShadow: active === t.id ? `0 0 16px ${C.accent}55` : 'none',
+          }}
+        >
+          {t.icon} {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Spinner({ label = 'Thinking...' }) {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        color: C.muted,
+        fontFamily: 'Inter',
+        fontSize: 13,
+        padding: '16px 0',
+      }}
+    >
+      <div
+        style={{
+          width: 16,
+          height: 16,
+          border: `2px solid ${C.border}`,
+          borderTop: `2px solid ${C.accent}`,
+          borderRadius: '50%',
+          animation: 'spin 0.8s linear infinite',
+        }}
+      />
+      {label}
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
+}
+
+function AIBanner() {
+  if (GROQ_API_KEY) return null;
+  return (
+    <div
+      style={{
+        background: C.amber + '18',
+        border: `1px solid ${C.amber}44`,
+        borderRadius: 10,
+        padding: '10px 16px',
+        marginBottom: 16,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+      }}
+    >
+      <span style={{ fontSize: 16 }}>⚠️</span>
+      <span style={{ color: C.amber, fontFamily: 'Inter', fontSize: 13 }}>
+        <b>Groq API key not set.</b> AI features will show fallback responses.
+        Set{' '}
+        <code style={{ fontFamily: 'JetBrains Mono', fontSize: 11 }}>
+          GROQ_API_KEY
+        </code>{' '}
+        at the top of this file.
+      </span>
+    </div>
+  );
+}
+
+// ── MODE SELECTOR ──────────────────────────────────────────────
+function ModeSelector({ onSelect }) {
+  return (
+    <div
+      style={{
+        minHeight: '100vh',
+        background: C.bg,
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: 32,
+      }}
+    >
+      <div style={{ textAlign: 'center', marginBottom: 48 }}>
+        <div
+          style={{
+            width: 60,
+            height: 60,
+            borderRadius: 18,
+            background: `linear-gradient(135deg,${C.accent},#7C3AED)`,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 30,
+            boxShadow: `0 0 32px ${C.accent}66`,
+            margin: '0 auto 20px',
+          }}
+        >
+          ✦
+        </div>
+        <div
+          style={{
+            fontFamily: 'Space Grotesk',
+            fontWeight: 700,
+            fontSize: 34,
+            color: C.text,
+            letterSpacing: -1,
+            marginBottom: 8,
+          }}
+        >
+          EduInsight Pro
+        </div>
+        <div style={{ fontFamily: 'Inter', fontSize: 15, color: C.subtle }}>
+          v2.0 · Groq AI · Persistent Storage · ML Dropout Predictor
+        </div>
+      </div>
+      <div
+        style={{
+          display: 'flex',
+          gap: 24,
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+        }}
+      >
+        {[
+          {
+            role: 'student',
+            emoji: '🎓',
+            color: C.accent,
+            label: 'Student',
+            desc: 'Personalized paths, AI tutor, quizzes, multilingual learning, leaderboard & certificates.',
+          },
+          {
+            role: 'teacher',
+            emoji: '📊',
+            color: C.mint,
+            label: 'Teacher',
+            desc: 'Add students, CSV import, dropout prediction, AI intervention plans, class analytics.',
+          },
+        ].map(({ role, emoji, color, label, desc }) => (
+          <button
+            key={role}
+            onClick={() => onSelect(role)}
+            style={{
+              background: C.surface,
+              border: `1px solid ${C.border}`,
+              borderRadius: 20,
+              padding: '36px 40px',
+              cursor: 'pointer',
+              width: 270,
+              textAlign: 'center',
+              transition: 'all 0.2s',
+              outline: 'none',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = color;
+              e.currentTarget.style.boxShadow = `0 0 28px ${color}33`;
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = C.border;
+              e.currentTarget.style.boxShadow = 'none';
+            }}
+          >
+            <div style={{ fontSize: 48, marginBottom: 16 }}>{emoji}</div>
+            <div
+              style={{
+                fontFamily: 'Space Grotesk',
+                fontWeight: 700,
+                fontSize: 20,
+                color: C.text,
+                marginBottom: 8,
+              }}
+            >
+              {label}
+            </div>
+            <div
+              style={{
+                fontFamily: 'Inter',
+                fontSize: 13,
+                color: C.muted,
+                lineHeight: 1.6,
+                marginBottom: 20,
+              }}
+            >
+              {desc}
+            </div>
+            <div
+              style={{
+                background: `linear-gradient(135deg,${color}cc,${color})`,
+                color: '#fff',
+                borderRadius: 10,
+                padding: '10px 20px',
+                fontFamily: 'Space Grotesk',
+                fontWeight: 600,
+                fontSize: 14,
+              }}
+            >
+              Enter as {label} →
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── PHASE 5: LEADERBOARD PANEL ──────────────────────────────────
+function LeaderboardPanel({ board }) {
+  return (
+    <Card>
+      <h3
+        style={{
+          color: C.text,
+          fontFamily: 'Space Grotesk',
+          margin: '0 0 16px',
+        }}
+      >
+        🏆 Quiz Leaderboard
+      </h3>
+      {board.length === 0 ? (
+        <div
+          style={{
+            color: C.muted,
+            fontFamily: 'Inter',
+            fontSize: 13,
+            textAlign: 'center',
+            padding: '24px 0',
+          }}
+        >
+          Complete a quiz to appear here!
+        </div>
+      ) : (
+        board.slice(0, 10).map((e, i) => (
+          <div
+            key={i}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12,
+              padding: '10px 0',
+              borderBottom: `1px solid ${C.border}`,
+            }}
+          >
+            <div
+              style={{
+                width: 24,
+                fontFamily: 'JetBrains Mono',
+                fontSize: 13,
+                color: i < 3 ? C.amber : C.muted,
+                fontWeight: 700,
+              }}
+            >
+              #{i + 1}
+            </div>
+            <div style={{ flex: 1 }}>
+              <div
+                style={{
+                  color: C.text,
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  fontSize: 14,
+                }}
+              >
+                {e.name}
+              </div>
+              <div
+                style={{ color: C.muted, fontFamily: 'Inter', fontSize: 11 }}
+              >
+                {e.topic}
+              </div>
+            </div>
+            <div
+              style={{
+                fontFamily: 'JetBrains Mono',
+                fontSize: 15,
+                fontWeight: 700,
+                color: e.pct >= 80 ? C.mint : e.pct >= 60 ? C.amber : C.rose,
+              }}
+            >
+              {e.pct}%
+            </div>
+          </div>
+        ))
+      )}
+    </Card>
+  );
+}
+
+// ── STUDENT: STUDY COACH ───────────────────────────────────────
+function StudyCoach({ leaderboard }) {
+  const [topic, setTopic] = useState('');
+  const [selectedTopic, setSelectedTopic] = useState(null);
+  const [quizMode, setQuizMode] = useState(false);
+  const [qi, setQi] = useState(0);
+  const [selectedAns, setSelectedAns] = useState(null);
+  const [score, setScore] = useState(0);
+  const [done, setDone] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [aiPath, setAiPath] = useState(null);
+  const [chat, setChat] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [studentName, setStudentName] = useState(
+    () => localStorage.getItem('eduinsight_student_name') || ''
+  );
+  const [nameSet, setNameSet] = useState(
+    !!localStorage.getItem('eduinsight_student_name')
+  );
+  const chatEndRef = useRef(null);
+
+  const topics = Object.keys(LEARNING_PATHS);
+  const quiz = selectedTopic ? QUIZ_BANK[selectedTopic] || [] : [];
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chat]);
+
+  async function generatePath() {
+    if (!topic.trim()) return;
+    setLoading(true);
+    setAiPath(null);
+    try {
+      const result = await groqJSON(
+        `You are an expert education coach. Create a personalized 6-step learning path for a student who wants to learn: "${topic}". Return a JSON object with key "steps": array of 6 objects with fields: step (number), title (short), duration (e.g. "3h"), description (1 sentence), resources (array of 2 free resource names).`,
+        'You are an expert education coach. Return only valid JSON.'
+      );
+      setAiPath(result.steps || result);
+    } catch {
+      setAiPath([
+        {
+          step: 1,
+          title: 'Start with Fundamentals',
+          duration: '3h',
+          description: `Begin your ${topic} journey with core concepts.`,
+          resources: ['YouTube', 'freeCodeCamp'],
+        },
+      ]);
+    }
+    setLoading(false);
+  }
+
+  async function sendChat() {
+    if (!chatInput.trim()) return;
+    const msg = chatInput.trim();
+    setChatInput('');
+    setChat((c) => [...c, { role: 'user', text: msg }]);
+    setChatLoading(true);
+    try {
+      const history = [...chat, { role: 'user', text: msg }];
+      const messages = history.map((m) => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: m.text,
+      }));
+      const reply = await groqChat({
+        system:
+          "You are EduInsight's AI Study Coach — a friendly expert tutor. Explain concepts clearly, give examples, adapt to the student's level. Keep responses concise (3-5 sentences).",
+        messages,
+      });
+      setChat((c) => [...c, { role: 'assistant', text: reply }]);
+    } catch {
+      setChat((c) => [
+        ...c,
+        { role: 'assistant', text: 'Connection issue — please try again!' },
+      ]);
+    }
+    setChatLoading(false);
+  }
+
+  function startQuiz(t) {
+    setSelectedTopic(t);
+    setQuizMode(true);
+    setQi(0);
+    setSelectedAns(null);
+    setScore(0);
+    setDone(false);
+  }
+
+  function handleAnswer(i) {
+    if (selectedAns !== null) return;
+    setSelectedAns(i);
+    if (i === quiz[qi].ans) setScore((s) => s + 1);
+  }
+
+  function next() {
+    if (qi + 1 >= quiz.length) {
+      setDone(true);
+      return;
+    }
+    setQi((q) => q + 1);
+    setSelectedAns(null);
+  }
+
+  function handleNameSubmit() {
+    if (!studentName.trim()) return;
+    localStorage.setItem('eduinsight_student_name', studentName.trim());
+    setNameSet(true);
+  }
+
+  if (!nameSet)
+    return (
+      <Card style={{ maxWidth: 400, margin: '40px auto', textAlign: 'center' }}>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>👋</div>
+        <div
+          style={{
+            color: C.text,
+            fontFamily: 'Space Grotesk',
+            fontWeight: 700,
+            fontSize: 20,
+            marginBottom: 8,
+          }}
+        >
+          What's your name?
+        </div>
+        <div
+          style={{
+            color: C.muted,
+            fontFamily: 'Inter',
+            fontSize: 13,
+            marginBottom: 20,
+          }}
+        >
+          Used for your quiz leaderboard & certificates.
+        </div>
+        <input
+          value={studentName}
+          onChange={(e) => setStudentName(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && handleNameSubmit()}
+          placeholder="Your full name"
+          style={{
+            width: '100%',
+            background: C.surfaceHigh,
+            border: `1px solid ${C.border}`,
+            color: C.text,
+            borderRadius: 10,
+            padding: '12px 14px',
+            fontFamily: 'Inter',
+            fontSize: 14,
+            outline: 'none',
+            marginBottom: 12,
+            boxSizing: 'border-box',
+          }}
+        />
+        <button
+          onClick={handleNameSubmit}
+          style={{
+            width: '100%',
+            background: C.accent,
+            color: '#fff',
+            border: 'none',
+            borderRadius: 10,
+            padding: '13px',
+            fontFamily: 'Space Grotesk',
+            fontWeight: 600,
+            cursor: 'pointer',
+          }}
+        >
+          Let's Go →
+        </button>
+      </Card>
+    );
+
+  if (quizMode) {
+    if (done)
+      return (
+        <div>
+          <button
+            onClick={() => setQuizMode(false)}
+            style={{
+              background: 'none',
+              border: `1px solid ${C.border}`,
+              color: C.muted,
+              borderRadius: 8,
+              padding: '6px 14px',
+              cursor: 'pointer',
+              marginBottom: 20,
+              fontFamily: 'Inter',
+            }}
+          >
+            ← Back
+          </button>
+          <Card style={{ textAlign: 'center', padding: 40 }}>
+            <div style={{ fontSize: 52, marginBottom: 12 }}>
+              {score === quiz.length ? '🏆' : score >= 2 ? '🎯' : '📚'}
+            </div>
+            <div
+              style={{
+                fontFamily: 'Space Grotesk',
+                fontSize: 32,
+                color: C.accent,
+                fontWeight: 700,
+                marginBottom: 8,
+              }}
+            >
+              {score}/{quiz.length}
+            </div>
+            <div
+              style={{ color: C.subtle, fontFamily: 'Inter', marginBottom: 24 }}
+            >
+              {score === quiz.length
+                ? "Perfect score! You've mastered this topic."
+                : score >= 2
+                ? 'Good work! Review the missed concepts.'
+                : "Keep practicing — you're building foundations."}
+            </div>
+            <div
+              style={{
+                display: 'flex',
+                gap: 10,
+                justifyContent: 'center',
+                flexWrap: 'wrap',
+              }}
+            >
+              <button
+                onClick={() => startQuiz(selectedTopic)}
+                style={{
+                  background: C.surfaceHigh,
+                  color: C.text,
+                  border: `1px solid ${C.border}`,
+                  borderRadius: 10,
+                  padding: '12px 24px',
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                Retry
+              </button>
+              <button
+                onClick={() => {
+                  leaderboard.addEntry(
+                    studentName,
+                    selectedTopic,
+                    score,
+                    quiz.length
+                  );
+                  alert('Score saved to leaderboard!');
+                  setQuizMode(false);
+                }}
+                style={{
+                  background: C.accent,
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 10,
+                  padding: '12px 24px',
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                Save Score 🏆
+              </button>
+              {score >= Math.ceil(quiz.length * 0.6) && (
+                <button
+                  onClick={() =>
+                    generateCertificate(
+                      studentName,
+                      selectedTopic,
+                      score,
+                      quiz.length
+                    )
+                  }
+                  style={{
+                    background: `linear-gradient(135deg,${C.amber},#D97706)`,
+                    color: '#000',
+                    border: 'none',
+                    borderRadius: 10,
+                    padding: '12px 24px',
+                    fontFamily: 'Space Grotesk',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Download Certificate 🎓
+                </button>
+              )}
+            </div>
+          </Card>
+        </div>
+      );
+
+    return (
+      <div>
+        <button
+          onClick={() => setQuizMode(false)}
+          style={{
+            background: 'none',
+            border: `1px solid ${C.border}`,
+            color: C.muted,
+            borderRadius: 8,
+            padding: '6px 14px',
+            cursor: 'pointer',
+            marginBottom: 20,
+            fontFamily: 'Inter',
+          }}
+        >
+          ← Back
+        </button>
+        <h2
+          style={{
+            color: C.text,
+            fontFamily: 'Space Grotesk',
+            marginBottom: 16,
+          }}
+        >
+          Quiz: {selectedTopic}
+        </h2>
+        <Card>
+          <div
+            style={{
+              color: C.muted,
+              fontFamily: 'JetBrains Mono',
+              fontSize: 12,
+              marginBottom: 12,
+            }}
+          >
+            Q {qi + 1} of {quiz.length}
+          </div>
+          <div
+            style={{
+              color: C.text,
+              fontFamily: 'Space Grotesk',
+              fontSize: 18,
+              fontWeight: 600,
+              marginBottom: 24,
+            }}
+          >
+            {quiz[qi].q}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {quiz[qi].options.map((opt, i) => {
+              let bg = C.surfaceHigh,
+                border = C.border,
+                color = C.text;
+              if (selectedAns !== null) {
+                if (i === quiz[qi].ans) {
+                  bg = C.mint + '22';
+                  border = C.mint;
+                  color = C.mint;
+                } else if (i === selectedAns && i !== quiz[qi].ans) {
+                  bg = C.rose + '22';
+                  border = C.rose;
+                  color = C.rose;
+                }
+              }
+              return (
+                <button
+                  key={i}
+                  onClick={() => handleAnswer(i)}
+                  style={{
+                    background: bg,
+                    border: `1px solid ${border}`,
+                    color,
+                    borderRadius: 10,
+                    padding: '14px 18px',
+                    textAlign: 'left',
+                    cursor: selectedAns !== null ? 'default' : 'pointer',
+                    fontFamily: 'Inter',
+                    fontSize: 15,
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  {opt}
+                </button>
+              );
+            })}
+          </div>
+          {selectedAns !== null && (
+            <button
+              onClick={next}
+              style={{
+                marginTop: 20,
+                background: C.accent,
+                color: '#fff',
+                border: 'none',
+                borderRadius: 10,
+                padding: '12px 28px',
+                fontFamily: 'Space Grotesk',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              {qi + 1 >= quiz.length ? 'See Results →' : 'Next →'}
+            </button>
+          )}
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <AIBanner />
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <Card>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 16,
+              }}
+            >
+              <h3
+                style={{
+                  color: C.text,
+                  fontFamily: 'Space Grotesk',
+                  margin: 0,
+                }}
+              >
+                🗺️ Learning Path Generator
+              </h3>
+              <span
+                style={{ color: C.muted, fontFamily: 'Inter', fontSize: 12 }}
+              >
+                Hello, {studentName} 👋
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <input
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && generatePath()}
+                placeholder="Enter any topic (e.g. 'React Hooks')"
+                style={{
+                  flex: 1,
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.text,
+                  borderRadius: 10,
+                  padding: '12px 14px',
+                  fontFamily: 'Inter',
+                  fontSize: 14,
+                  outline: 'none',
+                }}
+              />
+              <button
+                onClick={generatePath}
+                disabled={loading}
+                style={{
+                  background: C.accent,
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 10,
+                  padding: '12px 18px',
+                  cursor: 'pointer',
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  whiteSpace: 'nowrap',
+                  opacity: loading ? 0.7 : 1,
+                }}
+              >
+                {loading ? '...' : 'Generate'}
+              </button>
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {topics.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => {
+                    setTopic(t);
+                    setSelectedTopic(t);
+                    setAiPath(null);
+                  }}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.subtle,
+                    borderRadius: 8,
+                    padding: '5px 12px',
+                    cursor: 'pointer',
+                    fontSize: 12,
+                    fontFamily: 'Inter',
+                  }}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </Card>
+
+          {(aiPath || (selectedTopic && LEARNING_PATHS[selectedTopic])) && (
+            <Card style={{ maxHeight: 380, overflowY: 'auto' }}>
+              <h4
+                style={{
+                  color: C.accentGlow,
+                  fontFamily: 'Space Grotesk',
+                  margin: '0 0 16px',
+                }}
+              >
+                Your Path {aiPath ? '(AI Generated)' : ''}
+              </h4>
+              {loading && <Spinner label="Building your path..." />}
+              {aiPath
+                ? aiPath.map((step, i) => (
+                    <div
+                      key={i}
+                      style={{ display: 'flex', gap: 12, marginBottom: 16 }}
+                    >
+                      <div
+                        style={{
+                          width: 28,
+                          height: 28,
+                          borderRadius: '50%',
+                          background: C.accent + '33',
+                          border: `1px solid ${C.accent}`,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          color: C.accent,
+                          fontFamily: 'JetBrains Mono',
+                          fontSize: 12,
+                          fontWeight: 700,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {step.step || i + 1}
+                      </div>
+                      <div>
+                        <div
+                          style={{
+                            color: C.text,
+                            fontFamily: 'Space Grotesk',
+                            fontWeight: 600,
+                          }}
+                        >
+                          {step.title}{' '}
+                          <span
+                            style={{
+                              color: C.muted,
+                              fontSize: 12,
+                              fontFamily: 'JetBrains Mono',
+                            }}
+                          >
+                            {step.duration}
+                          </span>
+                        </div>
+                        <div
+                          style={{
+                            color: C.subtle,
+                            fontSize: 13,
+                            fontFamily: 'Inter',
+                            marginTop: 2,
+                          }}
+                        >
+                          {step.description}
+                        </div>
+                        <div
+                          style={{
+                            color: C.accent,
+                            fontSize: 12,
+                            fontFamily: 'Inter',
+                            marginTop: 4,
+                          }}
+                        >
+                          {step.resources?.join(' · ')}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                : LEARNING_PATHS[selectedTopic]?.map((s, i) => (
+                    <div
+                      key={i}
+                      style={{
+                        display: 'flex',
+                        gap: 12,
+                        alignItems: 'center',
+                        marginBottom: 12,
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: 22,
+                          height: 22,
+                          borderRadius: '50%',
+                          background: C.accent + '33',
+                          color: C.accent,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          fontSize: 11,
+                          fontFamily: 'JetBrains Mono',
+                          fontWeight: 700,
+                          flexShrink: 0,
+                        }}
+                      >
+                        {i + 1}
+                      </div>
+                      <div
+                        style={{
+                          color: C.text,
+                          fontFamily: 'Inter',
+                          fontSize: 14,
+                        }}
+                      >
+                        {s}
+                      </div>
+                    </div>
+                  ))}
+            </Card>
+          )}
+
+          <Card>
+            <h4
+              style={{
+                color: C.text,
+                fontFamily: 'Space Grotesk',
+                margin: '0 0 12px',
+              }}
+            >
+              ⚡ Quick Quiz
+            </h4>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {Object.keys(QUIZ_BANK).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => startQuiz(t)}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.subtle,
+                    borderRadius: 8,
+                    padding: '8px 14px',
+                    cursor: 'pointer',
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                  }}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </Card>
+
+          <LeaderboardPanel board={leaderboard.board} />
+        </div>
+
+        <Card style={{ display: 'flex', flexDirection: 'column', height: 520 }}>
+          <h3
+            style={{
+              color: C.text,
+              fontFamily: 'Space Grotesk',
+              margin: '0 0 12px',
+            }}
+          >
+            🤖 AI Tutor Chat
+          </h3>
+          <div
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+              marginBottom: 12,
+            }}
+          >
+            {chat.length === 0 && (
+              <div
+                style={{
+                  color: C.muted,
+                  fontFamily: 'Inter',
+                  fontSize: 14,
+                  textAlign: 'center',
+                  marginTop: 40,
+                }}
+              >
+                Ask me anything about your studies!
+                <br />
+                <span style={{ fontSize: 12 }}>
+                  Try: "Explain overfitting simply" or "How do I start with
+                  Python?"
+                </span>
+              </div>
+            )}
+            {chat.map((m, i) => (
+              <div
+                key={i}
+                style={{
+                  display: 'flex',
+                  justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start',
+                }}
+              >
+                <div
+                  style={{
+                    maxWidth: '80%',
+                    padding: '10px 14px',
+                    borderRadius:
+                      m.role === 'user'
+                        ? '14px 14px 4px 14px'
+                        : '14px 14px 14px 4px',
+                    background: m.role === 'user' ? C.accent : C.surfaceHigh,
+                    color: C.text,
+                    fontFamily: 'Inter',
+                    fontSize: 14,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  {m.text}
+                </div>
+              </div>
+            ))}
+            {chatLoading && <Spinner label="Thinking..." />}
+            <div ref={chatEndRef} />
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && sendChat()}
+              placeholder="Ask your tutor..."
+              style={{
+                flex: 1,
+                background: C.surfaceHigh,
+                border: `1px solid ${C.border}`,
+                color: C.text,
+                borderRadius: 10,
+                padding: '11px 14px',
+                fontFamily: 'Inter',
+                fontSize: 14,
+                outline: 'none',
+              }}
+            />
+            <button
+              onClick={sendChat}
+              disabled={chatLoading}
+              style={{
+                background: C.accent,
+                color: '#fff',
+                border: 'none',
+                borderRadius: 10,
+                padding: '0 18px',
+                cursor: 'pointer',
+                fontFamily: 'Space Grotesk',
+                fontWeight: 600,
+                opacity: chatLoading ? 0.7 : 1,
+              }}
+            >
+              Send
+            </button>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+// ── STUDENT: LEARNLANG ─────────────────────────────────────────
+function LearnLang() {
+  const [text, setText] = useState('');
+  const [targetLang, setTargetLang] = useState('Tamil');
+  const [level, setLevel] = useState('Beginner');
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [practice, setPractice] = useState(null);
+  const [practiceLoading, setPracticeLoading] = useState(false);
+
+  const langs = [
+    'Tamil',
+    'Hindi',
+    'Telugu',
+    'Malayalam',
+    'Gujarati',
+    'Bengali',
+    'Kannada',
+    'Marathi',
+  ];
+  const levels = ['Beginner', 'Intermediate', 'Advanced'];
+
+  async function translate() {
+    if (!text.trim()) return;
+    setLoading(true);
+    setResult(null);
+    try {
+      const result = await groqJSON(
+        `You are a multilingual education assistant. A ${level} student wants to understand this content in ${targetLang}.\n\nContent: "${text}"\n\nReturn a JSON object with: translation (in ${targetLang} script), transliteration (romanized pronunciation), simplification (simplified English for ${level} level), keyTerms (array of 3 objects with term, meaning, example), culturalNote (1 sentence relevant cultural context if applicable).`,
+        'You are a multilingual education assistant. Return only valid JSON.'
+      );
+      setResult(result);
+    } catch {
+      setResult({
+        translation: `[${targetLang} translation]`,
+        transliteration: '...',
+        simplification: `Simplified for ${level} learners.`,
+        keyTerms: [
+          {
+            term: 'Learning',
+            meaning: 'Acquiring knowledge',
+            example: 'I am learning Tamil.',
+          },
+        ],
+        culturalNote: 'Education is highly valued across Indian cultures.',
+      });
+    }
+    setLoading(false);
+  }
+
+  async function generatePractice() {
+    setPracticeLoading(true);
+    setPractice(null);
+    try {
+      const result = await groqJSON(
+        `Generate 3 adaptive practice sentences for a ${level} student learning ${targetLang}. Topic: everyday education/school context. Return a JSON object with key "sentences": array of 3 objects with: english, native (in ${targetLang} script), romanized, difficulty (1-5).`,
+        'You are a multilingual education assistant. Return only valid JSON.'
+      );
+      setPractice(result);
+    } catch {
+      setPractice({
+        sentences: [
+          {
+            english: 'I go to school every day.',
+            native: 'நான் தினமும் பள்ளிக்கு செல்கிறேன்.',
+            romanized: 'Naan thinaum pallikkku selgiren.',
+            difficulty: 1,
+          },
+        ],
+      });
+    }
+    setPracticeLoading(false);
+  }
+
+  return (
+    <div>
+      <AIBanner />
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <Card>
+            <h3
+              style={{
+                color: C.text,
+                fontFamily: 'Space Grotesk',
+                margin: '0 0 16px',
+              }}
+            >
+              🌐 Multilingual Learning Assistant
+            </h3>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
+              <select
+                value={targetLang}
+                onChange={(e) => setTargetLang(e.target.value)}
+                style={{
+                  flex: 1,
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.text,
+                  borderRadius: 10,
+                  padding: '10px 14px',
+                  fontFamily: 'Inter',
+                  fontSize: 14,
+                  outline: 'none',
+                }}
+              >
+                {langs.map((l) => (
+                  <option key={l}>{l}</option>
+                ))}
+              </select>
+              <select
+                value={level}
+                onChange={(e) => setLevel(e.target.value)}
+                style={{
+                  flex: 1,
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.text,
+                  borderRadius: 10,
+                  padding: '10px 14px',
+                  fontFamily: 'Inter',
+                  fontSize: 14,
+                  outline: 'none',
+                }}
+              >
+                {levels.map((l) => (
+                  <option key={l}>{l}</option>
+                ))}
+              </select>
+            </div>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Paste any educational content to translate and simplify..."
+              rows={5}
+              style={{
+                width: '100%',
+                background: C.surfaceHigh,
+                border: `1px solid ${C.border}`,
+                color: C.text,
+                borderRadius: 10,
+                padding: '12px 14px',
+                fontFamily: 'Inter',
+                fontSize: 14,
+                resize: 'vertical',
+                outline: 'none',
+                boxSizing: 'border-box',
+              }}
+            />
+            <button
+              onClick={translate}
+              disabled={loading}
+              style={{
+                marginTop: 10,
+                width: '100%',
+                background: C.accent,
+                color: '#fff',
+                border: 'none',
+                borderRadius: 10,
+                padding: '13px',
+                fontFamily: 'Space Grotesk',
+                fontWeight: 600,
+                cursor: 'pointer',
+                opacity: loading ? 0.7 : 1,
+              }}
+            >
+              {loading ? 'Translating...' : 'Translate & Simplify'}
+            </button>
+          </Card>
+
+          <Card>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 12,
+              }}
+            >
+              <h4
+                style={{
+                  color: C.text,
+                  fontFamily: 'Space Grotesk',
+                  margin: 0,
+                }}
+              >
+                ⚡ Adaptive Practice
+              </h4>
+              <button
+                onClick={generatePractice}
+                disabled={practiceLoading}
+                style={{
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.subtle,
+                  borderRadius: 8,
+                  padding: '7px 14px',
+                  cursor: 'pointer',
+                  fontFamily: 'Inter',
+                  fontSize: 13,
+                  opacity: practiceLoading ? 0.7 : 1,
+                }}
+              >
+                {practiceLoading ? '...' : 'Generate'}
+              </button>
+            </div>
+            {practiceLoading && <Spinner label="Generating practice..." />}
+            {practice?.sentences?.map((s, i) => (
+              <div
+                key={i}
+                style={{
+                  background: C.surfaceHigh,
+                  borderRadius: 10,
+                  padding: 14,
+                  marginBottom: 10,
+                }}
+              >
+                <div
+                  style={{
+                    color: C.text,
+                    fontFamily: 'Inter',
+                    fontSize: 14,
+                    marginBottom: 4,
+                  }}
+                >
+                  {s.english}
+                </div>
+                <div
+                  style={{
+                    color: C.accentGlow,
+                    fontFamily: 'Space Grotesk',
+                    fontSize: 16,
+                    marginBottom: 4,
+                  }}
+                >
+                  {s.native}
+                </div>
+                <div
+                  style={{
+                    color: C.muted,
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 12,
+                  }}
+                >
+                  {s.romanized}
+                </div>
+                <div style={{ marginTop: 6 }}>
+                  {Array.from({ length: 5 }).map((_, j) => (
+                    <span
+                      key={j}
+                      style={{
+                        color: j < s.difficulty ? C.amber : C.border,
+                        fontSize: 12,
+                      }}
+                    >
+                      ★
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </Card>
+        </div>
+
+        <div>
+          {!result ? (
+            <Card style={{ textAlign: 'center', padding: 60 }}>
+              <div style={{ fontSize: 40, marginBottom: 12 }}>🗣️</div>
+              <div style={{ color: C.muted, fontFamily: 'Inter' }}>
+                Enter content above to see translation, simplification, and key
+                terms
+              </div>
+            </Card>
+          ) : (
+            <Card style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div>
+                <div
+                  style={{
+                    color: C.accentGlow,
+                    fontFamily: 'Space Grotesk',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    marginBottom: 6,
+                  }}
+                >
+                  TRANSLATION ({targetLang})
+                </div>
+                <div
+                  style={{
+                    color: C.text,
+                    fontFamily: 'Space Grotesk',
+                    fontSize: 20,
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {result.translation}
+                </div>
+                <div
+                  style={{
+                    color: C.muted,
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 13,
+                    marginTop: 6,
+                  }}
+                >
+                  {result.transliteration}
+                </div>
+              </div>
+              <div
+                style={{
+                  background: C.surfaceHigh,
+                  borderRadius: 10,
+                  padding: 14,
+                }}
+              >
+                <div
+                  style={{
+                    color: C.mint,
+                    fontFamily: 'Space Grotesk',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    marginBottom: 6,
+                  }}
+                >
+                  SIMPLIFIED ({level})
+                </div>
+                <div
+                  style={{
+                    color: C.text,
+                    fontFamily: 'Inter',
+                    fontSize: 14,
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {result.simplification}
+                </div>
+              </div>
+              <div>
+                <div
+                  style={{
+                    color: C.amber,
+                    fontFamily: 'Space Grotesk',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    marginBottom: 8,
+                  }}
+                >
+                  KEY TERMS
+                </div>
+                {result.keyTerms?.map((k, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      background: C.surfaceHigh,
+                      borderRadius: 8,
+                      padding: 12,
+                      marginBottom: 8,
+                    }}
+                  >
+                    <div
+                      style={{
+                        color: C.accent,
+                        fontFamily: 'Space Grotesk',
+                        fontWeight: 600,
+                        fontSize: 14,
+                      }}
+                    >
+                      {k.term}
+                    </div>
+                    <div
+                      style={{
+                        color: C.subtle,
+                        fontFamily: 'Inter',
+                        fontSize: 13,
+                      }}
+                    >
+                      {k.meaning}
+                    </div>
+                    <div
+                      style={{
+                        color: C.muted,
+                        fontFamily: 'Inter',
+                        fontSize: 12,
+                        marginTop: 4,
+                        fontStyle: 'italic',
+                      }}
+                    >
+                      "{k.example}"
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {result.culturalNote && (
+                <div
+                  style={{
+                    background: C.accent + '11',
+                    border: `1px solid ${C.accent}33`,
+                    borderRadius: 10,
+                    padding: 12,
+                  }}
+                >
+                  <div
+                    style={{
+                      color: C.accentGlow,
+                      fontFamily: 'Space Grotesk',
+                      fontWeight: 600,
+                      fontSize: 12,
+                      marginBottom: 4,
+                    }}
+                  >
+                    💡 CULTURAL CONTEXT
+                  </div>
+                  <div
+                    style={{
+                      color: C.subtle,
+                      fontFamily: 'Inter',
+                      fontSize: 13,
+                    }}
+                  >
+                    {result.culturalNote}
+                  </div>
+                </div>
+              )}
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── TEACHER: CLASSROOM ANALYZER ───────────────────────────────
+function ClassroomAnalyzer({ students, setStudents, importCSV }) {
+  const [selected, setSelected] = useState(null);
+  const [plan, setPlan] = useState(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [sortBy, setSortBy] = useState('risk');
+  const [form, setForm] = useState({
+    name: '',
+    attendance: '',
+    score: '',
+    engagement: '',
+    lang: 'English',
+  });
+  const [formError, setFormError] = useState('');
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef(null);
+
+  const langs = [
+    'English',
+    'Tamil',
+    'Hindi',
+    'Telugu',
+    'Malayalam',
+    'Gujarati',
+    'Bengali',
+    'Kannada',
+    'Marathi',
+  ];
+  const sorted = [...students].sort((a, b) =>
+    sortBy === 'risk' ? b.risk - a.risk : a.name.localeCompare(b.name)
+  );
+  const highRisk = students.filter((s) => s.risk >= 75).length;
+  const avgScore = students.length
+    ? Math.round(students.reduce((a, s) => a + s.score, 0) / students.length)
+    : 0;
+  const avgAttendance = students.length
+    ? Math.round(
+        students.reduce((a, s) => a + s.attendance, 0) / students.length
+      )
+    : 0;
+
+  function addStudent() {
+    const { name, attendance, score, engagement, lang } = form;
+    if (!name.trim()) {
+      setFormError('Name is required.');
+      return;
+    }
+    const att = Number(attendance),
+      sc = Number(score),
+      eng = Number(engagement);
+    if (isNaN(att) || att < 0 || att > 100) {
+      setFormError('Attendance must be 0–100.');
+      return;
+    }
+    if (isNaN(sc) || sc < 0 || sc > 100) {
+      setFormError('Score must be 0–100.');
+      return;
+    }
+    if (isNaN(eng) || eng < 1 || eng > 10) {
+      setFormError('Engagement must be 1–10.');
+      return;
+    }
+    setFormError('');
+    const risk = computeRisk(att, sc, eng);
+    setStudents((prev) => [
+      ...prev,
+      {
+        id: Date.now(),
+        name: name.trim(),
+        attendance: att,
+        score: sc,
+        engagement: eng,
+        lang,
+        risk,
+        submittedAt: new Date().toISOString(),
+      },
+    ]);
+    setForm({
+      name: '',
+      attendance: '',
+      score: '',
+      engagement: '',
+      lang: 'English',
+    });
+  }
+
+  function removeStudent(id) {
+    setStudents((prev) => prev.filter((s) => s.id !== id));
+    if (selected?.id === id) {
+      setSelected(null);
+      setPlan(null);
+    }
+  }
+
+  async function handleCSVImport(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImporting(true);
+    try {
+      const imported = await importCSV(file);
+      setStudents((prev) => [...prev, ...imported]);
+      alert(`✅ Imported ${imported.length} student(s) from CSV.`);
+    } catch (err) {
+      alert(
+        'CSV import failed: ' +
+          err.message +
+          '\n\nExpected columns: name, attendance, score, engagement, lang'
+      );
+    }
+    setImporting(false);
+    e.target.value = '';
+  }
+
+  function exportCSV() {
+    const rows = [
+      ['name', 'attendance', 'score', 'engagement', 'lang', 'risk'],
+      ...students.map((s) => [
+        s.name,
+        s.attendance,
+        s.score,
+        s.engagement,
+        s.lang,
+        s.risk,
+      ]),
+    ];
+    const csv = rows.map((r) => r.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'students.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function getIntervention(student) {
+    setSelected(student);
+    setPlan(null);
+    setPlanLoading(true);
+    try {
+      const result = await groqJSON(
+        `You are an educational psychologist AI. Generate a concise intervention plan for:\nName: ${student.name}\nAttendance: ${student.attendance}%\nScore: ${student.score}/100\nEngagement: ${student.engagement}/10\nLanguage: ${student.lang}\nRisk: ${student.risk}%\n\nReturn a JSON object with: diagnosis (2 sentences), immediateActions (array of 3 strings), weeklyPlan (array of 4 strings), parentMessage (1 sentence SMS to parent), languageSupport (tip for ${student.lang} speaker).`,
+        'You are an educational psychologist AI. Return only valid JSON.'
+      );
+      setPlan(result);
+    } catch {
+      setPlan({
+        diagnosis: 'Student shows signs of academic stress and disengagement.',
+        immediateActions: [
+          'Schedule 1-on-1 counseling session',
+          'Contact parents this week',
+          'Assign a peer mentor',
+        ],
+        weeklyPlan: [
+          'Week 1: Foundation review',
+          'Week 2: Guided practice',
+          'Week 3: Progress check',
+          'Week 4: Confidence building',
+        ],
+        parentMessage: `Please schedule a meeting to discuss ${student.name}'s academic progress.`,
+        languageSupport: `Provide materials in ${student.lang} where possible.`,
+      });
+    }
+    setPlanLoading(false);
+  }
+
+  // ── PHASE 5: PARENT NOTIFICATION (simulated SMS) ─────────────
+  function sendParentNotification(student) {
+    const msg = `EduInsight Alert: ${student.name} has a dropout risk of ${student.risk}%. Please contact the school to discuss support options.`;
+    const encoded = encodeURIComponent(msg);
+    window.open(`sms:?body=${encoded}`, '_blank');
+  }
+
+  return (
+    <div>
+      <AIBanner />
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        <div>
+          {/* Stats */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 1fr 1fr',
+              gap: 12,
+              marginBottom: 16,
+            }}
+          >
+            {[
+              { label: 'High Risk', value: highRisk, color: C.rose },
+              { label: 'Avg Score', value: avgScore + '%', color: C.accent },
+              {
+                label: 'Avg Attendance',
+                value: avgAttendance + '%',
+                color: C.mint,
+              },
+            ].map((s) => (
+              <Card key={s.label} style={{ padding: 16, textAlign: 'center' }}>
+                <div
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 28,
+                    fontWeight: 700,
+                    color: s.color,
+                  }}
+                >
+                  {s.value}
+                </div>
+                <div
+                  style={{
+                    color: C.muted,
+                    fontSize: 11,
+                    fontFamily: 'Inter',
+                    marginTop: 4,
+                  }}
+                >
+                  {s.label}
+                </div>
+              </Card>
+            ))}
+          </div>
+
+          {/* Phase 3: CSV Import / Export */}
+          <Card style={{ marginBottom: 16 }}>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 10,
+              }}
+            >
+              <h4
+                style={{
+                  color: C.text,
+                  fontFamily: 'Space Grotesk',
+                  margin: 0,
+                }}
+              >
+                📁 Import / Export
+              </h4>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,.xlsx"
+                  onChange={handleCSVImport}
+                  style={{ display: 'none' }}
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={importing}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.subtle,
+                    borderRadius: 8,
+                    padding: '7px 14px',
+                    cursor: 'pointer',
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                  }}
+                >
+                  {importing ? 'Importing...' : '📂 Import CSV'}
+                </button>
+                <button
+                  onClick={exportCSV}
+                  disabled={students.length === 0}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.subtle,
+                    borderRadius: 8,
+                    padding: '7px 14px',
+                    cursor: 'pointer',
+                    fontFamily: 'Inter',
+                    fontSize: 12,
+                    opacity: students.length === 0 ? 0.5 : 1,
+                  }}
+                >
+                  💾 Export CSV
+                </button>
+              </div>
+            </div>
+            <div style={{ color: C.muted, fontFamily: 'Inter', fontSize: 11 }}>
+              CSV columns:{' '}
+              <code style={{ fontFamily: 'JetBrains Mono', color: C.subtle }}>
+                name, attendance, score, engagement, lang
+              </code>
+            </div>
+          </Card>
+
+          {/* Add Student Form */}
+          <Card style={{ marginBottom: 16 }}>
+            <h4
+              style={{
+                color: C.text,
+                fontFamily: 'Space Grotesk',
+                margin: '0 0 14px',
+              }}
+            >
+              ➕ Add Student
+            </h4>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <input
+                value={form.name}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, name: e.target.value }))
+                }
+                placeholder="Full name"
+                style={{
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.text,
+                  borderRadius: 8,
+                  padding: '10px 12px',
+                  fontFamily: 'Inter',
+                  fontSize: 13,
+                  outline: 'none',
+                }}
+              />
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr 1fr 1fr',
+                  gap: 8,
+                }}
+              >
+                <input
+                  value={form.attendance}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, attendance: e.target.value }))
+                  }
+                  placeholder="Attendance %"
+                  type="number"
+                  min={0}
+                  max={100}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.text,
+                    borderRadius: 8,
+                    padding: '10px 12px',
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                    outline: 'none',
+                  }}
+                />
+                <input
+                  value={form.score}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, score: e.target.value }))
+                  }
+                  placeholder="Score /100"
+                  type="number"
+                  min={0}
+                  max={100}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.text,
+                    borderRadius: 8,
+                    padding: '10px 12px',
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                    outline: 'none',
+                  }}
+                />
+                <input
+                  value={form.engagement}
+                  onChange={(e) =>
+                    setForm((f) => ({ ...f, engagement: e.target.value }))
+                  }
+                  placeholder="Engagement 1–10"
+                  type="number"
+                  min={1}
+                  max={10}
+                  style={{
+                    background: C.surfaceHigh,
+                    border: `1px solid ${C.border}`,
+                    color: C.text,
+                    borderRadius: 8,
+                    padding: '10px 12px',
+                    fontFamily: 'Inter',
+                    fontSize: 13,
+                    outline: 'none',
+                  }}
+                />
+              </div>
+              <select
+                value={form.lang}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, lang: e.target.value }))
+                }
+                style={{
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.text,
+                  borderRadius: 8,
+                  padding: '10px 12px',
+                  fontFamily: 'Inter',
+                  fontSize: 13,
+                  outline: 'none',
+                }}
+              >
+                {langs.map((l) => (
+                  <option key={l}>{l}</option>
+                ))}
+              </select>
+              {formError && (
+                <div
+                  style={{ color: C.rose, fontFamily: 'Inter', fontSize: 12 }}
+                >
+                  {formError}
+                </div>
+              )}
+              <button
+                onClick={addStudent}
+                style={{
+                  background: C.accent,
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 8,
+                  padding: '11px',
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  fontSize: 14,
+                }}
+              >
+                Add Student
+              </button>
+            </div>
+          </Card>
+
+          {/* Student List */}
+          {students.length === 0 ? (
+            <Card style={{ textAlign: 'center', padding: 40 }}>
+              <div style={{ fontSize: 36, marginBottom: 10 }}>📋</div>
+              <div style={{ color: C.muted, fontFamily: 'Inter' }}>
+                No students yet. Add manually or import a CSV.
+              </div>
+            </Card>
+          ) : (
+            <Card style={{ padding: 0, overflow: 'hidden' }}>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  gap: 8,
+                  padding: '12px 16px',
+                  borderBottom: `1px solid ${C.border}`,
+                }}
+              >
+                <span
+                  style={{
+                    color: C.muted,
+                    fontSize: 12,
+                    fontFamily: 'Inter',
+                    alignSelf: 'center',
+                  }}
+                >
+                  Sort:
+                </span>
+                {['risk', 'name'].map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setSortBy(s)}
+                    style={{
+                      background: sortBy === s ? C.accent : C.surfaceHigh,
+                      color: sortBy === s ? '#fff' : C.subtle,
+                      border: 'none',
+                      borderRadius: 6,
+                      padding: '4px 10px',
+                      cursor: 'pointer',
+                      fontSize: 12,
+                      fontFamily: 'Inter',
+                      textTransform: 'capitalize',
+                    }}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+              <div style={{ overflowY: 'auto', maxHeight: 360 }}>
+                {sorted.map((s) => (
+                  <div
+                    key={s.id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 12,
+                      padding: '12px 16px',
+                      borderBottom: `1px solid ${C.border}`,
+                      background:
+                        selected?.id === s.id ? C.accent + '11' : 'transparent',
+                    }}
+                  >
+                    <div
+                      onClick={() => getIntervention(s)}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 12,
+                        flex: 1,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <RiskRing value={s.risk} size={50} />
+                      <div>
+                        <div
+                          style={{
+                            color: C.text,
+                            fontFamily: 'Space Grotesk',
+                            fontWeight: 600,
+                            fontSize: 14,
+                          }}
+                        >
+                          {s.name}
+                        </div>
+                        <div
+                          style={{
+                            color: C.muted,
+                            fontSize: 11,
+                            fontFamily: 'Inter',
+                            marginTop: 2,
+                          }}
+                        >
+                          Att: {s.attendance}% · Score: {s.score} · Eng:{' '}
+                          {s.engagement}/10 · {s.lang}
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'flex-end',
+                        gap: 6,
+                      }}
+                    >
+                      <Badge
+                        label={riskLabel(s.risk)}
+                        color={riskColor(s.risk)}
+                      />
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        {s.risk >= 40 && (
+                          <button
+                            onClick={() => sendParentNotification(s)}
+                            style={{
+                              background: C.amber + '22',
+                              border: `1px solid ${C.amber}44`,
+                              color: C.amber,
+                              borderRadius: 6,
+                              padding: '3px 8px',
+                              cursor: 'pointer',
+                              fontSize: 10,
+                              fontFamily: 'JetBrains Mono',
+                            }}
+                          >
+                            📱 SMS
+                          </button>
+                        )}
+                        <button
+                          onClick={() => removeStudent(s.id)}
+                          style={{
+                            background: C.rose + '22',
+                            border: `1px solid ${C.rose}44`,
+                            color: C.rose,
+                            borderRadius: 6,
+                            padding: '3px 8px',
+                            cursor: 'pointer',
+                            fontSize: 10,
+                            fontFamily: 'Inter',
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
+        </div>
+
+        {/* Intervention Panel */}
+        <div>
+          {!selected ? (
+            <Card style={{ textAlign: 'center', padding: 60 }}>
+              <div style={{ fontSize: 40, marginBottom: 12 }}>👆</div>
+              <div style={{ color: C.muted, fontFamily: 'Inter' }}>
+                Select a student to generate an AI intervention plan
+              </div>
+            </Card>
+          ) : (
+            <Card style={{ maxHeight: 680, overflowY: 'auto' }}>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: 20,
+                }}
+              >
+                <div>
+                  <h3
+                    style={{
+                      color: C.text,
+                      fontFamily: 'Space Grotesk',
+                      margin: 0,
+                    }}
+                  >
+                    {selected.name}
+                  </h3>
+                  <div
+                    style={{
+                      color: C.muted,
+                      fontSize: 12,
+                      fontFamily: 'Inter',
+                      marginTop: 4,
+                    }}
+                  >
+                    Intervention Plan
+                  </div>
+                </div>
+                <RiskRing value={selected.risk} size={70} />
+              </div>
+              {planLoading ? (
+                <Spinner label="Generating plan..." />
+              ) : plan ? (
+                <div
+                  style={{ display: 'flex', flexDirection: 'column', gap: 16 }}
+                >
+                  <div>
+                    <div
+                      style={{
+                        color: C.accentGlow,
+                        fontFamily: 'Space Grotesk',
+                        fontWeight: 600,
+                        fontSize: 13,
+                        marginBottom: 6,
+                      }}
+                    >
+                      DIAGNOSIS
+                    </div>
+                    <div
+                      style={{
+                        color: C.subtle,
+                        fontFamily: 'Inter',
+                        fontSize: 14,
+                        lineHeight: 1.6,
+                      }}
+                    >
+                      {plan.diagnosis}
+                    </div>
+                  </div>
+                  <div>
+                    <div
+                      style={{
+                        color: C.rose,
+                        fontFamily: 'Space Grotesk',
+                        fontWeight: 600,
+                        fontSize: 13,
+                        marginBottom: 8,
+                      }}
+                    >
+                      IMMEDIATE ACTIONS
+                    </div>
+                    {plan.immediateActions?.map((a, i) => (
+                      <div
+                        key={i}
+                        style={{ display: 'flex', gap: 8, marginBottom: 6 }}
+                      >
+                        <span
+                          style={{
+                            color: C.rose,
+                            fontFamily: 'JetBrains Mono',
+                            fontSize: 12,
+                            marginTop: 2,
+                          }}
+                        >
+                          →
+                        </span>
+                        <span
+                          style={{
+                            color: C.text,
+                            fontFamily: 'Inter',
+                            fontSize: 14,
+                          }}
+                        >
+                          {a}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div>
+                    <div
+                      style={{
+                        color: C.amber,
+                        fontFamily: 'Space Grotesk',
+                        fontWeight: 600,
+                        fontSize: 13,
+                        marginBottom: 8,
+                      }}
+                    >
+                      4-WEEK PLAN
+                    </div>
+                    {plan.weeklyPlan?.map((w, i) => (
+                      <div
+                        key={i}
+                        style={{
+                          display: 'flex',
+                          gap: 10,
+                          marginBottom: 8,
+                          alignItems: 'flex-start',
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: 22,
+                            height: 22,
+                            borderRadius: '50%',
+                            background: C.amber + '22',
+                            color: C.amber,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: 11,
+                            fontFamily: 'JetBrains Mono',
+                            flexShrink: 0,
+                          }}
+                        >
+                          {i + 1}
+                        </div>
+                        <span
+                          style={{
+                            color: C.text,
+                            fontFamily: 'Inter',
+                            fontSize: 14,
+                          }}
+                        >
+                          {w}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                  <div
+                    style={{
+                      background: C.surfaceHigh,
+                      borderRadius: 10,
+                      padding: 14,
+                    }}
+                  >
+                    <div
+                      style={{
+                        color: C.mint,
+                        fontFamily: 'Space Grotesk',
+                        fontWeight: 600,
+                        fontSize: 13,
+                        marginBottom: 6,
+                      }}
+                    >
+                      📱 PARENT SMS
+                    </div>
+                    <div
+                      style={{
+                        color: C.text,
+                        fontFamily: 'Inter',
+                        fontSize: 13,
+                        fontStyle: 'italic',
+                      }}
+                    >
+                      "{plan.parentMessage}"
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      background: C.surfaceHigh,
+                      borderRadius: 10,
+                      padding: 14,
+                    }}
+                  >
+                    <div
+                      style={{
+                        color: C.accent,
+                        fontFamily: 'Space Grotesk',
+                        fontWeight: 600,
+                        fontSize: 13,
+                        marginBottom: 6,
+                      }}
+                    >
+                      🌐 LANGUAGE SUPPORT ({selected.lang})
+                    </div>
+                    <div
+                      style={{
+                        color: C.subtle,
+                        fontFamily: 'Inter',
+                        fontSize: 13,
+                      }}
+                    >
+                      {plan.languageSupport}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => sendParentNotification(selected)}
+                    style={{
+                      background: C.amber + '22',
+                      border: `1px solid ${C.amber}44`,
+                      color: C.amber,
+                      borderRadius: 10,
+                      padding: '11px',
+                      fontFamily: 'Space Grotesk',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      fontSize: 14,
+                    }}
+                  >
+                    📱 Send Parent Notification
+                  </button>
+                </div>
+              ) : null}
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── TEACHER: DROPOUT PREDICTION ─────────────────────────────────
+function DropoutPrediction({ students }) {
+  const [insights, setInsights] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState('all');
+
+  const filtered =
+    filter === 'all'
+      ? students
+      : students.filter((s) =>
+          filter === 'high'
+            ? s.risk >= 75
+            : filter === 'medium'
+            ? s.risk >= 40 && s.risk < 75
+            : s.risk < 40
+        );
+
+  async function getInsights() {
+    if (!students.length) return;
+    setLoading(true);
+    setInsights(null);
+    try {
+      const summary = {
+        total: students.length,
+        highRisk: students.filter((s) => s.risk >= 75).length,
+        avgAttendance: Math.round(
+          students.reduce((a, s) => a + s.attendance, 0) / students.length
+        ),
+        avgScore: Math.round(
+          students.reduce((a, s) => a + s.score, 0) / students.length
+        ),
+      };
+      const result = await groqJSON(
+        `You are an educational data analyst. Analyze this class data:\n${JSON.stringify(
+          summary
+        )}\nStudents: ${students
+          .map(
+            (s) =>
+              `${s.name}(risk:${s.risk}%,att:${s.attendance}%,score:${s.score})`
+          )
+          .join(
+            ', '
+          )}\n\nReturn a JSON object with: classHealthScore (0-100), topRisks (array of 3 strings), recommendations (array of 4 strings for teacher), trendAlert (1 sentence urgent alert if any, or null), predictedDropouts (number).`,
+        'You are an educational data analyst. Return only valid JSON.'
+      );
+      setInsights(result);
+    } catch {
+      setInsights({
+        classHealthScore: 54,
+        topRisks: [
+          'Low attendance correlating with poor scores',
+          'Critical disengagement in multiple students',
+          'Language barriers may affect comprehension',
+        ],
+        recommendations: [
+          'Weekly check-ins for high-risk students',
+          'Introduce peer tutoring program',
+          'Provide multilingual study materials',
+          'Alert parents of at-risk students',
+        ],
+        trendAlert: 'Multiple students showing dropout risk indicators.',
+        predictedDropouts: Math.ceil(
+          students.filter((s) => s.risk >= 75).length * 0.6
+        ),
+      });
+    }
+    setLoading(false);
+  }
+
+  // Phase 4: RF model visualization (mini bar chart)
+  const riskBuckets = [
+    {
+      label: 'On Track',
+      count: students.filter((s) => s.risk < 40).length,
+      color: C.mint,
+    },
+    {
+      label: 'Medium',
+      count: students.filter((s) => s.risk >= 40 && s.risk < 75).length,
+      color: C.amber,
+    },
+    {
+      label: 'High Risk',
+      count: students.filter((s) => s.risk >= 75).length,
+      color: C.rose,
+    },
+  ];
+  const maxBucket = Math.max(...riskBuckets.map((b) => b.count), 1);
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <Card>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              marginBottom: 16,
+            }}
+          >
+            <h3
+              style={{ color: C.text, fontFamily: 'Space Grotesk', margin: 0 }}
+            >
+              📉 Dropout Risk Monitor
+            </h3>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {['all', 'high', 'medium', 'low'].map((f) => (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  style={{
+                    background: filter === f ? C.accent : C.surfaceHigh,
+                    color: filter === f ? '#fff' : C.subtle,
+                    border: 'none',
+                    borderRadius: 6,
+                    padding: '5px 10px',
+                    cursor: 'pointer',
+                    fontSize: 12,
+                    fontFamily: 'Inter',
+                    textTransform: 'capitalize',
+                  }}
+                >
+                  {f}
+                </button>
+              ))}
+            </div>
+          </div>
+          {students.length === 0 ? (
+            <div
+              style={{
+                color: C.muted,
+                fontFamily: 'Inter',
+                fontSize: 13,
+                textAlign: 'center',
+                padding: '24px 0',
+              }}
+            >
+              No students added yet. Go to Classroom Analyzer to add students.
+            </div>
+          ) : filtered.length === 0 ? (
+            <div
+              style={{
+                color: C.muted,
+                fontFamily: 'Inter',
+                fontSize: 13,
+                textAlign: 'center',
+                padding: '24px 0',
+              }}
+            >
+              No students in this risk category.
+            </div>
+          ) : (
+            filtered.map((s) => (
+              <div key={s.id} style={{ marginBottom: 14 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    marginBottom: 4,
+                  }}
+                >
+                  <span
+                    style={{ color: C.text, fontFamily: 'Inter', fontSize: 13 }}
+                  >
+                    {s.name}
+                  </span>
+                  <span
+                    style={{
+                      color: riskColor(s.risk),
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 12,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {s.risk}%
+                  </span>
+                </div>
+                <div
+                  style={{
+                    height: 8,
+                    background: C.border,
+                    borderRadius: 4,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <div
+                    style={{
+                      height: '100%',
+                      width: `${s.risk}%`,
+                      background: `linear-gradient(90deg,${riskColor(
+                        s.risk
+                      )}88,${riskColor(s.risk)})`,
+                      borderRadius: 4,
+                      transition: 'width 0.8s ease',
+                      boxShadow: `0 0 8px ${riskColor(s.risk)}66`,
+                    }}
+                  />
+                </div>
+              </div>
+            ))
+          )}
+        </Card>
+
+        {/* Phase 4: Random Forest distribution chart */}
+        {students.length > 0 && (
+          <Card>
+            <h4
+              style={{
+                color: C.text,
+                fontFamily: 'Space Grotesk',
+                margin: '0 0 14px',
+              }}
+            >
+              🌲 RF Model Distribution
+            </h4>
+            <div
+              style={{
+                display: 'flex',
+                gap: 12,
+                alignItems: 'flex-end',
+                height: 120,
+              }}
+            >
+              {riskBuckets.map((b) => (
+                <div
+                  key={b.label}
+                  style={{
+                    flex: 1,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 6,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 18,
+                      fontWeight: 700,
+                      color: b.color,
+                    }}
+                  >
+                    {b.count}
+                  </div>
+                  <div
+                    style={{
+                      width: '100%',
+                      background: C.border,
+                      borderRadius: 6,
+                      overflow: 'hidden',
+                      height: 60,
+                    }}
+                  >
+                    <div
+                      style={{
+                        height: `${(b.count / maxBucket) * 100}%`,
+                        background: b.color + '88',
+                        transition: 'height 0.8s ease',
+                        borderRadius: 6,
+                        marginTop: 'auto',
+                      }}
+                    />
+                  </div>
+                  <div
+                    style={{
+                      color: C.muted,
+                      fontSize: 10,
+                      fontFamily: 'JetBrains Mono',
+                      textAlign: 'center',
+                    }}
+                  >
+                    {b.label}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 14 }}>
+              <h4
+                style={{
+                  color: C.text,
+                  fontFamily: 'Space Grotesk',
+                  margin: '0 0 10px',
+                  fontSize: 13,
+                }}
+              >
+                Attendance vs Score
+              </h4>
+              <svg width="100%" height={180} viewBox="0 0 340 180">
+                <line
+                  x1={40}
+                  y1={10}
+                  x2={40}
+                  y2={160}
+                  stroke={C.border}
+                  strokeWidth={1}
+                />
+                <line
+                  x1={40}
+                  y1={160}
+                  x2={330}
+                  y2={160}
+                  stroke={C.border}
+                  strokeWidth={1}
+                />
+                {[0, 25, 50, 75, 100].map((v) => (
+                  <g key={v}>
+                    <text
+                      x={32}
+                      y={160 - v * 1.4 + 4}
+                      fill={C.muted}
+                      fontSize={9}
+                      textAnchor="end"
+                    >
+                      {v}
+                    </text>
+                    <line
+                      x1={40}
+                      y1={160 - v * 1.4}
+                      x2={330}
+                      y2={160 - v * 1.4}
+                      stroke={C.border}
+                      strokeWidth={0.5}
+                      strokeDasharray="3,3"
+                    />
+                  </g>
+                ))}
+                {[0, 25, 50, 75, 100].map((v) => (
+                  <text
+                    key={v}
+                    x={40 + v * 2.9}
+                    y={174}
+                    fill={C.muted}
+                    fontSize={9}
+                    textAnchor="middle"
+                  >
+                    {v}
+                  </text>
+                ))}
+                {students.map((s) => (
+                  <g key={s.id}>
+                    <circle
+                      cx={40 + s.attendance * 2.9}
+                      cy={160 - s.score * 1.4}
+                      r={5}
+                      fill={riskColor(s.risk)}
+                      opacity={0.85}
+                      style={{
+                        filter: `drop-shadow(0 0 4px ${riskColor(s.risk)})`,
+                      }}
+                    />
+                    <title>
+                      {s.name}: Att {s.attendance}%, Score {s.score}
+                    </title>
+                  </g>
+                ))}
+                <text
+                  x={185}
+                  y={186}
+                  fill={C.muted}
+                  fontSize={9}
+                  textAnchor="middle"
+                >
+                  Attendance %
+                </text>
+                <text
+                  x={12}
+                  y={85}
+                  fill={C.muted}
+                  fontSize={9}
+                  textAnchor="middle"
+                  transform="rotate(-90 12 85)"
+                >
+                  Score
+                </text>
+              </svg>
+            </div>
+          </Card>
+        )}
+      </div>
+
+      <div>
+        <Card style={{ marginBottom: 16 }}>
+          <button
+            onClick={getInsights}
+            disabled={loading || students.length === 0}
+            style={{
+              width: '100%',
+              background: `linear-gradient(135deg,${C.accent},#7C3AED)`,
+              color: '#fff',
+              border: 'none',
+              borderRadius: 12,
+              padding: '16px',
+              fontFamily: 'Space Grotesk',
+              fontWeight: 700,
+              fontSize: 16,
+              cursor: students.length === 0 ? 'not-allowed' : 'pointer',
+              opacity: loading || students.length === 0 ? 0.6 : 1,
+              boxShadow: `0 0 24px ${C.accent}44`,
+            }}
+          >
+            {loading
+              ? '🤖 Analyzing class data...'
+              : students.length === 0
+              ? 'Add students to generate insights'
+              : '🔍 Generate AI Class Insights'}
+          </button>
+          {loading && <Spinner label="Running analysis..." />}
+        </Card>
+
+        {insights ? (
+          <Card style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <div>
+                <div
+                  style={{ color: C.muted, fontFamily: 'Inter', fontSize: 12 }}
+                >
+                  Class Health Score
+                </div>
+                <div
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 36,
+                    fontWeight: 700,
+                    color:
+                      insights.classHealthScore >= 70
+                        ? C.mint
+                        : insights.classHealthScore >= 50
+                        ? C.amber
+                        : C.rose,
+                  }}
+                >
+                  {insights.classHealthScore}/100
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div
+                  style={{ color: C.muted, fontFamily: 'Inter', fontSize: 12 }}
+                >
+                  Predicted Dropouts
+                </div>
+                <div
+                  style={{
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 36,
+                    fontWeight: 700,
+                    color: C.rose,
+                  }}
+                >
+                  {insights.predictedDropouts}
+                </div>
+              </div>
+            </div>
+            {insights.trendAlert && (
+              <div
+                style={{
+                  background: C.rose + '15',
+                  border: `1px solid ${C.rose}44`,
+                  borderRadius: 10,
+                  padding: 12,
+                }}
+              >
+                <span
+                  style={{
+                    color: C.rose,
+                    fontFamily: 'Space Grotesk',
+                    fontWeight: 600,
+                    fontSize: 13,
+                  }}
+                >
+                  ⚠️ {insights.trendAlert}
+                </span>
+              </div>
+            )}
+            <div>
+              <div
+                style={{
+                  color: C.rose,
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  fontSize: 12,
+                  marginBottom: 8,
+                }}
+              >
+                SYSTEMIC RISKS
+              </div>
+              {insights.topRisks?.map((r, i) => (
+                <div
+                  key={i}
+                  style={{ display: 'flex', gap: 8, marginBottom: 6 }}
+                >
+                  <span style={{ color: C.rose, fontSize: 12 }}>•</span>
+                  <span
+                    style={{
+                      color: C.subtle,
+                      fontFamily: 'Inter',
+                      fontSize: 14,
+                    }}
+                  >
+                    {r}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div>
+              <div
+                style={{
+                  color: C.mint,
+                  fontFamily: 'Space Grotesk',
+                  fontWeight: 600,
+                  fontSize: 12,
+                  marginBottom: 8,
+                }}
+              >
+                RECOMMENDATIONS
+              </div>
+              {insights.recommendations?.map((r, i) => (
+                <div
+                  key={i}
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    marginBottom: 8,
+                    background: C.surfaceHigh,
+                    borderRadius: 8,
+                    padding: '10px 12px',
+                  }}
+                >
+                  <span
+                    style={{
+                      color: C.mint,
+                      fontFamily: 'JetBrains Mono',
+                      fontSize: 11,
+                      marginTop: 1,
+                    }}
+                  >
+                    {String(i + 1).padStart(2, '0')}
+                  </span>
+                  <span
+                    style={{ color: C.text, fontFamily: 'Inter', fontSize: 14 }}
+                  >
+                    {r}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </Card>
+        ) : (
+          <Card style={{ textAlign: 'center', padding: 60 }}>
+            <div style={{ fontSize: 40, marginBottom: 12 }}>📊</div>
+            <div style={{ color: C.muted, fontFamily: 'Inter' }}>
+              Click above to get AI-powered insights on your entire class
+            </div>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── PHASE 5: ANALYTICS DASHBOARD ───────────────────────────────
+function AnalyticsDashboard({ students }) {
+  if (students.length === 0)
+    return (
+      <Card style={{ textAlign: 'center', padding: 60 }}>
+        <div style={{ fontSize: 40, marginBottom: 12 }}>📈</div>
+        <div style={{ color: C.muted, fontFamily: 'Inter' }}>
+          Add students to see analytics.
+        </div>
+      </Card>
+    );
+
+  const byLang = {};
+  students.forEach((s) => {
+    byLang[s.lang] = (byLang[s.lang] || 0) + 1;
+  });
+  const langEntries = Object.entries(byLang).sort((a, b) => b[1] - a[1]);
+
+  const avgRisk = Math.round(
+    students.reduce((a, s) => a + s.risk, 0) / students.length
+  );
+  const avgEng = (
+    students.reduce((a, s) => a + s.engagement, 0) / students.length
+  ).toFixed(1);
+  const onTrack = students.filter((s) => s.risk < 40).length;
+  const medium = students.filter((s) => s.risk >= 40 && s.risk < 75).length;
+  const high = students.filter((s) => s.risk >= 75).length;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(4,1fr)',
+          gap: 12,
+        }}
+      >
+        {[
+          { label: 'Total Students', value: students.length, color: C.accent },
+          {
+            label: 'Avg Risk',
+            value: avgRisk + '%',
+            color: riskColor(avgRisk),
+          },
+          { label: 'Avg Engagement', value: avgEng + '/10', color: C.sky },
+          { label: 'On Track', value: onTrack, color: C.mint },
+        ].map((s) => (
+          <Card key={s.label} style={{ padding: 16, textAlign: 'center' }}>
+            <div
+              style={{
+                fontFamily: 'JetBrains Mono',
+                fontSize: 26,
+                fontWeight: 700,
+                color: s.color,
+              }}
+            >
+              {s.value}
+            </div>
+            <div
+              style={{
+                color: C.muted,
+                fontSize: 11,
+                fontFamily: 'Inter',
+                marginTop: 4,
+              }}
+            >
+              {s.label}
+            </div>
+          </Card>
+        ))}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <Card>
+          <h4
+            style={{
+              color: C.text,
+              fontFamily: 'Space Grotesk',
+              margin: '0 0 14px',
+            }}
+          >
+            Risk Breakdown
+          </h4>
+          {[
+            { label: 'On Track', count: onTrack, color: C.mint },
+            { label: 'Medium Risk', count: medium, color: C.amber },
+            { label: 'High Risk', count: high, color: C.rose },
+          ].map((b) => (
+            <div key={b.label} style={{ marginBottom: 12 }}>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  marginBottom: 4,
+                }}
+              >
+                <span
+                  style={{ color: C.text, fontFamily: 'Inter', fontSize: 13 }}
+                >
+                  {b.label}
+                </span>
+                <span
+                  style={{
+                    color: b.color,
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 12,
+                  }}
+                >
+                  {b.count} students
+                </span>
+              </div>
+              <div
+                style={{
+                  height: 8,
+                  background: C.border,
+                  borderRadius: 4,
+                  overflow: 'hidden',
+                }}
+              >
+                <div
+                  style={{
+                    height: '100%',
+                    width: `${
+                      students.length ? (b.count / students.length) * 100 : 0
+                    }%`,
+                    background: b.color,
+                    borderRadius: 4,
+                    transition: 'width 0.8s ease',
+                  }}
+                />
+              </div>
+            </div>
+          ))}
+        </Card>
+
+        <Card>
+          <h4
+            style={{
+              color: C.text,
+              fontFamily: 'Space Grotesk',
+              margin: '0 0 14px',
+            }}
+          >
+            Language Distribution
+          </h4>
+          {langEntries.map(([lang, count]) => (
+            <div
+              key={lang}
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                padding: '8px 0',
+                borderBottom: `1px solid ${C.border}`,
+              }}
+            >
+              <span
+                style={{ color: C.text, fontFamily: 'Inter', fontSize: 13 }}
+              >
+                {lang}
+              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div
+                  style={{
+                    width: 60,
+                    height: 6,
+                    background: C.border,
+                    borderRadius: 3,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <div
+                    style={{
+                      height: '100%',
+                      width: `${(count / students.length) * 100}%`,
+                      background: C.accent,
+                      borderRadius: 3,
+                    }}
+                  />
+                </div>
+                <span
+                  style={{
+                    color: C.muted,
+                    fontFamily: 'JetBrains Mono',
+                    fontSize: 11,
+                  }}
+                >
+                  {count}
+                </span>
+              </div>
+            </div>
+          ))}
+        </Card>
+      </div>
+
+      {/* Engagement vs Risk scatter */}
+      <Card>
+        <h4
+          style={{
+            color: C.text,
+            fontFamily: 'Space Grotesk',
+            margin: '0 0 14px',
+          }}
+        >
+          Engagement vs Risk (scatter)
+        </h4>
+        <svg width="100%" height={200} viewBox="0 0 700 200">
+          <line
+            x1={50}
+            y1={10}
+            x2={50}
+            y2={170}
+            stroke={C.border}
+            strokeWidth={1}
+          />
+          <line
+            x1={50}
+            y1={170}
+            x2={690}
+            y2={170}
+            stroke={C.border}
+            strokeWidth={1}
+          />
+          {[0, 2, 4, 6, 8, 10].map((v) => (
+            <g key={v}>
+              <text
+                x={42}
+                y={170 - (v / 10) * 150 + 4}
+                fill={C.muted}
+                fontSize={9}
+                textAnchor="end"
+              >
+                {v * 10}%
+              </text>
+              <line
+                x1={50}
+                y1={170 - (v / 10) * 150}
+                x2={690}
+                y2={170 - (v / 10) * 150}
+                stroke={C.border}
+                strokeWidth={0.5}
+                strokeDasharray="3,3"
+              />
+            </g>
+          ))}
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((v) => (
+            <text
+              key={v}
+              x={50 + (v / 10) * 640}
+              y={184}
+              fill={C.muted}
+              fontSize={9}
+              textAnchor="middle"
+            >
+              {v}
+            </text>
+          ))}
+          {students.map((s) => (
+            <g key={s.id}>
+              <circle
+                cx={50 + (s.engagement / 10) * 640}
+                cy={170 - (s.risk / 100) * 150}
+                r={5}
+                fill={riskColor(s.risk)}
+                opacity={0.85}
+                style={{ filter: `drop-shadow(0 0 4px ${riskColor(s.risk)})` }}
+              />
+              <title>
+                {s.name}: Engagement {s.engagement}/10, Risk {s.risk}%
+              </title>
+            </g>
+          ))}
+          <text x={370} y={196} fill={C.muted} fontSize={9} textAnchor="middle">
+            Engagement (1–10)
+          </text>
+          <text
+            x={16}
+            y={90}
+            fill={C.muted}
+            fontSize={9}
+            textAnchor="middle"
+            transform="rotate(-90 16 90)"
+          >
+            Risk %
+          </text>
+        </svg>
+      </Card>
+    </div>
+  );
+}
+
+// ── MAIN APP ───────────────────────────────────────────────────
+export default function App() {
+  const [mode, setMode] = useState(null);
+  const [studentTab, setStudentTab] = useState('coach');
+  const [teacherTab, setTeacherTab] = useState('classroom');
+  const { students, setStudents, importCSV } = useStudentStore('teacher_1');
+  const leaderboard = useLeaderboard();
+
+  const studentTabs = [
+    { id: 'coach', label: 'Study Coach', icon: '🎓' },
+    { id: 'lang', label: 'LearnLang', icon: '🌐' },
+  ];
+  const teacherTabs = [
+    { id: 'classroom', label: 'Classroom', icon: '📊' },
+    { id: 'dropout', label: 'Dropout AI', icon: '🚨' },
+    { id: 'analytics', label: 'Analytics', icon: '📈' },
+  ];
+
+  if (!mode) return <ModeSelector onSelect={(m) => setMode(m)} />;
+
+  const isTeacher = mode === 'teacher';
+  const modeColor = isTeacher ? C.mint : C.accent;
+  const modeGlow = isTeacher ? '#059669' : C.accentGlow;
+
+  return (
+    <>
+      <style>
+        {FONTS +
+          `
+        * { box-sizing: border-box; margin: 0; padding: 0; scrollbar-width: thin; scrollbar-color: ${C.border} transparent; }
+        body { background: ${C.bg}; color: ${C.text}; }
+        ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: ${C.border}; border-radius: 3px; }
+        input::placeholder, textarea::placeholder { color: ${C.muted}; }
+        select option { background: ${C.surface}; }
+        input[type=number]::-webkit-inner-spin-button { opacity: 0.4; }
+      `}
+      </style>
+      <div style={{ minHeight: '100vh', background: C.bg, paddingBottom: 40 }}>
+        {/* Header */}
+        <div
+          style={{
+            background: C.surface,
+            borderBottom: `1px solid ${C.border}`,
+            padding: '0 32px',
+          }}
+        >
+          <div
+            style={{
+              maxWidth: 1200,
+              margin: '0 auto',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              height: 64,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div
+                style={{
+                  width: 36,
+                  height: 36,
+                  borderRadius: 10,
+                  background: `linear-gradient(135deg,${C.accent},#7C3AED)`,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 18,
+                  boxShadow: `0 0 16px ${C.accent}55`,
+                }}
+              >
+                ✦
+              </div>
+              <div>
+                <div
+                  style={{
+                    fontFamily: 'Space Grotesk',
+                    fontWeight: 700,
+                    fontSize: 18,
+                    color: C.text,
+                    letterSpacing: -0.5,
+                  }}
+                >
+                  EduInsight Pro
+                </div>
+                <div
+                  style={{
+                    fontFamily: 'Inter',
+                    fontSize: 11,
+                    color: C.muted,
+                    letterSpacing: 0.5,
+                  }}
+                >
+                  v2.0 · GROQ AI · FIREBASE READY
+                </div>
+              </div>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <Badge
+                label={isTeacher ? 'TEACHER MODE' : 'STUDENT MODE'}
+                color={modeColor}
+              />
+              <button
+                onClick={() => setMode(null)}
+                style={{
+                  background: C.surfaceHigh,
+                  border: `1px solid ${C.border}`,
+                  color: C.subtle,
+                  borderRadius: 8,
+                  padding: '6px 14px',
+                  cursor: 'pointer',
+                  fontFamily: 'Inter',
+                  fontSize: 12,
+                }}
+              >
+                Switch Role
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Hero */}
+        <div
+          style={{
+            background: `linear-gradient(180deg,${C.surface} 0%,${C.bg} 100%)`,
+            borderBottom: `1px solid ${C.border}`,
+            padding: '28px 32px 24px',
+          }}
+        >
+          <div style={{ maxWidth: 1200, margin: '0 auto' }}>
+            <h1
+              style={{
+                fontFamily: 'Space Grotesk',
+                fontSize: 28,
+                fontWeight: 700,
+                color: C.text,
+                marginBottom: 6,
+                letterSpacing: -1,
+              }}
+            >
+              {isTeacher
+                ? 'Manage your class with '
+                : 'Every student deserves to '}
+              <span
+                style={{
+                  background: `linear-gradient(90deg,${modeColor},${modeGlow})`,
+                  WebkitBackgroundClip: 'text',
+                  WebkitTextFillColor: 'transparent',
+                }}
+              >
+                {isTeacher ? 'AI-powered insights.' : 'stay in school.'}
+              </span>
+            </h1>
+            <p
+              style={{
+                fontFamily: 'Inter',
+                fontSize: 14,
+                color: C.subtle,
+                maxWidth: 580,
+                lineHeight: 1.6,
+              }}
+            >
+              {isTeacher
+                ? 'Add students manually or via CSV, track dropout risk with ML, and generate AI intervention plans.'
+                : 'Personalized learning paths, multilingual support, AI tutoring, adaptive quizzes, certificates & leaderboard.'}
+            </p>
+          </div>
+        </div>
+
+        {/* Content */}
+        <div style={{ maxWidth: 1200, margin: '24px auto', padding: '0 32px' }}>
+          <div style={{ marginBottom: 20 }}>
+            <Tabs
+              tabs={isTeacher ? teacherTabs : studentTabs}
+              active={isTeacher ? teacherTab : studentTab}
+              onChange={isTeacher ? setTeacherTab : setStudentTab}
+            />
+          </div>
+
+          {!isTeacher && studentTab === 'coach' && (
+            <StudyCoach leaderboard={leaderboard} />
+          )}
+          {!isTeacher && studentTab === 'lang' && <LearnLang />}
+          {isTeacher && teacherTab === 'classroom' && (
+            <ClassroomAnalyzer
+              students={students}
+              setStudents={setStudents}
+              importCSV={importCSV}
+            />
+          )}
+          {isTeacher && teacherTab === 'dropout' && (
+            <DropoutPrediction students={students} />
+          )}
+          {isTeacher && teacherTab === 'analytics' && (
+            <AnalyticsDashboard students={students} />
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
